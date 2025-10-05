@@ -1,0 +1,464 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <unistd.h>
+#include <time.h>
+
+#define VEHICULOS_POR_HORA 500
+#define HORAS_SIMULACION 24
+#define TOTAL_VEHICULOS (VEHICULOS_POR_HORA * HORAS_SIMULACION)
+#define SEGUNDOS_POR_HORA_SIMULACION 30  // segundos simulan 1 hora
+#define TOTAL_SEGUNDOS_SIMULACION (SEGUNDOS_POR_HORA_SIMULACION * HORAS_SIMULACION)  // minutos para 24 horas
+
+// Estructuras de datos
+typedef enum { AUTO, CAMION } vehicleType;
+typedef enum { DIR_1A4, DIR_4A1 } Direccion;
+
+typedef struct {
+    int id;              // Identificación del vehículo
+    vehicleType tipo;    // Auto o camion
+    Direccion dir;       // direccion de conduccion 
+    time_t horaEntrada;  // Hora de creación del vehículo
+} Vehiculo;
+
+typedef struct {
+    sem_t semaforo;      // Impide la entrada superior a la capacidad del subtramo
+    int capacidad;
+    int vehiculosPresentes;
+    int contadorAutos;
+    int contadorCamiones;
+    pthread_mutex_t mutex;
+} Subtramo;
+
+typedef struct {
+    sem_t semaforo;      // Para la capacidad deseada del hombrillo (Ilimitadas en la practica)
+    int vehiculosEsperando; // Contador actual de vehículos esperando
+    int maxEspera;    // Máximo histórico de vehículos esperando
+    time_t tiempoMaxEspera;  //Tiempo de espera más largo registrado
+    time_t tiempoTotalEspera; //Suma acumulada de todos los tiempos de espera
+    int totalVehiculosEsperado; //Total de vehículos que han esperado
+    pthread_mutex_t mutex;
+} Hombrillo;
+
+// Variables globales
+Subtramo subtramos[4];
+Hombrillo hombrillos[3];
+
+// Estadísticas
+int estadisticasHorarias[24][2] = {0}; // [hora][direccion] - 0:DIR_1A4, 1:DIR_4A1
+int estadisticasSubtramos[4][2] = {0}; // [subtramo][direccion]
+int totalVehiculosDia = 0;
+time_t inicioSimulacion;
+pthread_mutex_t statsMutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Inicialización de recursos
+void inicializar_recursos()
+{
+    // Configurar capacidades de subtramos
+    subtramos[0].capacidad = 4;  // Subtramo 1
+    subtramos[1].capacidad = 2;  // Subtramo 2 (2 autos o 1 camion)
+    subtramos[2].capacidad = 1;  // Subtramo 3
+    subtramos[3].capacidad = 3;  // Subtramo 4
+    
+    for (int i = 0; i < 4; i++) {
+        sem_init(&subtramos[i].semaforo, 0, subtramos[i].capacidad);
+        pthread_mutex_init(&subtramos[i].mutex, NULL);
+        subtramos[i].vehiculosPresentes = 0;
+        subtramos[i].contadorAutos = 0;
+        subtramos[i].contadorCamiones = 0;
+    }
+    
+    for (int i = 0; i < 3; i++) {
+        sem_init(&hombrillos[i].semaforo, 0, 9999); // Capacidad ilimitada
+        pthread_mutex_init(&hombrillos[i].mutex, NULL);
+        hombrillos[i].vehiculosEsperando = 0;
+        hombrillos[i].maxEspera = 0;
+        hombrillos[i].tiempoMaxEspera = 0;
+        hombrillos[i].tiempoTotalEspera = 0;
+        hombrillos[i].totalVehiculosEsperado = 0;
+    }
+}
+
+// Función para verificar si puede entrar al subtramo 2
+int entrar_subtramo2(vehicleType tipo)
+{
+    pthread_mutex_lock(&subtramos[1].mutex);
+    
+    int puede_entrar = 0;
+    if (tipo == AUTO) {
+        puede_entrar = (subtramos[1].contadorAutos < 2);
+    } else { // CAMION
+        puede_entrar = (subtramos[1].contadorCamiones == 0 && subtramos[1].contadorAutos == 0);
+    }
+    
+    // Si puede entrar, actualizar contadores INMEDIATAMENTE
+    if (puede_entrar) {
+        subtramos[1].vehiculosPresentes++;
+        if (tipo == AUTO) {
+            subtramos[1].contadorAutos++;
+        } else {
+            subtramos[1].contadorCamiones++;
+        }
+        printf("📊 Subtramo 2 - Autos: %d, Camiones: %d, Total: %d\n", 
+               subtramos[1].contadorAutos, subtramos[1].contadorCamiones, 
+               subtramos[1].vehiculosPresentes);
+    }
+    
+    pthread_mutex_unlock(&subtramos[1].mutex);
+    return puede_entrar;
+}
+
+// Obtener la hora actual de simulación (0-23)
+int obtener_hora_actual()
+{
+    time_t ahora = time(NULL);
+    double segundos_transcurridos = difftime(ahora, inicioSimulacion);
+    int hora_simulacion = (int)(segundos_transcurridos / SEGUNDOS_POR_HORA_SIMULACION) % 24;
+    return hora_simulacion;
+}
+
+// Actualizar estadísticas horarias
+void actualizar_estadisticas_horarias(Direccion dir)
+{
+    int hora = obtener_hora_actual();
+    if (hora >= 0 && hora < 24) {
+        pthread_mutex_lock(&statsMutex);
+        if (dir == DIR_1A4) {
+            estadisticasHorarias[hora][0]++;
+        } else {
+            estadisticasHorarias[hora][1]++;
+        }
+        totalVehiculosDia++;
+        pthread_mutex_unlock(&statsMutex);
+    }
+}
+
+// Función principal del vehículo - VERSIÓN CORREGIDA
+void* vehiculoThread(void* arg)
+{
+    Vehiculo* v = (Vehiculo*)arg;
+    int inicio, fin, paso;
+    
+    // Determinar dirección del viaje 
+    if (v->dir == DIR_1A4) {
+        inicio = 0; fin = 3; paso = 1;
+        printf("🟢 Vehículo %d (%s) INICIANDO viaje dirección 1→4\n", 
+               v->id, (v->tipo == AUTO) ? "Auto" : "Camión");
+    } else {
+        inicio = 3; fin = 0; paso = -1;
+        printf("🔵 Vehículo %d (%s) INICIANDO viaje dirección 4→1\n", 
+               v->id, (v->tipo == AUTO) ? "Auto" : "Camión");
+    }
+    
+    actualizar_estadisticas_horarias(v->dir);
+    
+    // Entrar al primer subtramo
+    printf("➡️  Vehículo %d entrando DIRECTAMENTE al subtramo %d\n", v->id, inicio + 1);
+    sem_wait(&subtramos[inicio].semaforo);
+    
+    pthread_mutex_lock(&subtramos[inicio].mutex);
+    subtramos[inicio].vehiculosPresentes++;
+    if (v->tipo == AUTO) {
+        subtramos[inicio].contadorAutos++;
+    } else {
+        subtramos[inicio].contadorCamiones++;
+    }
+    estadisticasSubtramos[inicio][v->dir]++;
+    printf("📊 Subtramo %d - Autos: %d, Camiones: %d, Total: %d\n", 
+           inicio + 1, subtramos[inicio].contadorAutos, 
+           subtramos[inicio].contadorCamiones, subtramos[inicio].vehiculosPresentes);
+    pthread_mutex_unlock(&subtramos[inicio].mutex);
+    
+    // Recorrer todos los subtramos
+    for (int i = inicio; i != fin + paso; i += paso) {
+        int siguiente = i + paso;
+        
+        // Verificar si es el último subtramo 
+        if (siguiente == fin + paso) {
+            printf("🎉 Vehículo %d COMPLETÓ su viaje en subtramo %d\n", v->id, i + 1);
+            
+            pthread_mutex_lock(&subtramos[i].mutex);
+            subtramos[i].vehiculosPresentes--;
+            if (v->tipo == AUTO) {
+                subtramos[i].contadorAutos--;
+            } else {
+                subtramos[i].contadorCamiones--;
+            }
+            pthread_mutex_unlock(&subtramos[i].mutex);
+            sem_post(&subtramos[i].semaforo);
+            
+            break;
+        }
+        
+        // Simular tiempo en el subtramo actual
+        int tiempo_subtramo = (rand() % 2) + 1;
+        printf("🚗 Vehículo %d CIRCULANDO en subtramo %d (%d segundos)\n", 
+               v->id, i + 1, tiempo_subtramo);
+        usleep(tiempo_subtramo * 35000);
+        
+        // Salir del subtramo actual
+        pthread_mutex_lock(&subtramos[i].mutex);
+        subtramos[i].vehiculosPresentes--;
+        if (v->tipo == AUTO) {
+            subtramos[i].contadorAutos--;
+        } else {
+            subtramos[i].contadorCamiones--;
+        }
+        printf("📊 Subtramo %d - Autos: %d, Camiones: %d, Total: %d\n", 
+               i + 1, subtramos[i].contadorAutos, 
+               subtramos[i].contadorCamiones, subtramos[i].vehiculosPresentes);
+        pthread_mutex_unlock(&subtramos[i].mutex);
+        
+        sem_post(&subtramos[i].semaforo);
+        printf("✅ Vehículo %d SALIÓ del subtramo %d\n", v->id, i + 1);
+        
+        // Calcular índice del hombrillo (código igual...)
+        int hombrillo_idx;
+        if (paso > 0) {
+            hombrillo_idx = i;
+        } else {
+            hombrillo_idx = i - 1;
+        }
+        
+        // ENTRADA AL SUBTRAMO 2 - VERSIÓN CORREGIDA
+        if (siguiente == 1) {
+            printf("➡️  Vehículo %d intentando ENTRAR al subtramo 2\n", v->id);
+            
+            int entro = 0;
+            while (!entro) {
+                pthread_mutex_lock(&subtramos[1].mutex);
+                
+                int puede_entrar = 0;
+                int capacidad_disponible = (subtramos[1].vehiculosPresentes < subtramos[1].capacidad);
+                
+                if (capacidad_disponible) {
+                    if (v->tipo == AUTO) {
+                        puede_entrar = (subtramos[1].contadorAutos < 2);
+                    } else {
+                        puede_entrar = (subtramos[1].contadorCamiones == 0 && subtramos[1].contadorAutos == 0);
+                    }
+                }
+                
+                if (puede_entrar) {
+                    // ENTRAR
+                    subtramos[1].vehiculosPresentes++;
+                    if (v->tipo == AUTO) {
+                        subtramos[1].contadorAutos++;
+                    } else {
+                        subtramos[1].contadorCamiones++;
+                    }
+                    estadisticasSubtramos[1][v->dir]++;
+                    printf("📊 Subtramo 2 - Autos: %d, Camiones: %d, Total: %d\n", 
+                        subtramos[1].contadorAutos, subtramos[1].contadorCamiones, 
+                        subtramos[1].vehiculosPresentes);
+                    entro = 1;
+                }
+                
+                pthread_mutex_unlock(&subtramos[1].mutex);
+                
+                if (!entro) {
+                    printf("🟡 Vehículo %d ESPERANDO para entrar al subtramo 2\n", v->id);
+                    usleep(30000);
+                }
+            }
+            
+            printf("✅ Vehículo %d ENTRÓ al subtramo 2\n", v->id);
+        } 
+        else // ✅ PARA OTROS SUBTRAMOS (código original)
+        {
+            // Verificar si está lleno para ir al hombrillo
+            int siguiente_lleno = 0;
+            pthread_mutex_lock(&subtramos[siguiente].mutex);
+            siguiente_lleno = (subtramos[siguiente].vehiculosPresentes >= subtramos[siguiente].capacidad);
+            pthread_mutex_unlock(&subtramos[siguiente].mutex);
+            
+            if (siguiente_lleno) {
+                // Código del hombrillo (igual al original)...
+                printf("🟡 Vehículo %d → Subtramo %d LLENO, YENDO al hombrillo %d\n", 
+                       v->id, siguiente + 1, hombrillo_idx + 1);
+                
+                time_t inicio_espera = time(NULL);
+                
+                pthread_mutex_lock(&hombrillos[hombrillo_idx].mutex);
+                hombrillos[hombrillo_idx].vehiculosEsperando++;
+                if (hombrillos[hombrillo_idx].vehiculosEsperando > hombrillos[hombrillo_idx].maxEspera) {
+                    hombrillos[hombrillo_idx].maxEspera = hombrillos[hombrillo_idx].vehiculosEsperando;
+                }
+                pthread_mutex_unlock(&hombrillos[hombrillo_idx].mutex);
+                
+                int puede_avanzar = 0;
+                while (!puede_avanzar) {
+                    usleep(30000);
+                    pthread_mutex_lock(&subtramos[siguiente].mutex);
+                    puede_avanzar = (subtramos[siguiente].vehiculosPresentes < subtramos[siguiente].capacidad);
+                    pthread_mutex_unlock(&subtramos[siguiente].mutex);
+                }
+                
+                pthread_mutex_lock(&hombrillos[hombrillo_idx].mutex);
+                hombrillos[hombrillo_idx].vehiculosEsperando--;
+                pthread_mutex_unlock(&hombrillos[hombrillo_idx].mutex);
+                
+                time_t fin_espera = time(NULL);
+                time_t duracion_espera = fin_espera - inicio_espera;
+                
+                pthread_mutex_lock(&hombrillos[hombrillo_idx].mutex);
+                if (duracion_espera > hombrillos[hombrillo_idx].tiempoMaxEspera) {
+                    hombrillos[hombrillo_idx].tiempoMaxEspera = duracion_espera;
+                }
+                hombrillos[hombrillo_idx].tiempoTotalEspera += duracion_espera;
+                hombrillos[hombrillo_idx].totalVehiculosEsperado++;
+                pthread_mutex_unlock(&hombrillos[hombrillo_idx].mutex);
+                
+                printf("⏱️  Vehículo %d ESPERÓ %ld segundos en hombrillo %d\n", 
+                       v->id, duracion_espera, hombrillo_idx + 1);
+            } else {
+                printf("🟢 Vehículo %d → Subtramo %d tiene ESPACIO, AVANZANDO directamente\n", 
+                       v->id, siguiente + 1);
+            }
+            
+            // ENTRAR al siguiente subtramo
+            printf("➡️  Vehículo %d ENTRANDO al subtramo %d\n", v->id, siguiente + 1);
+            sem_wait(&subtramos[siguiente].semaforo);
+            
+            pthread_mutex_lock(&subtramos[siguiente].mutex);
+            subtramos[siguiente].vehiculosPresentes++;
+            if (v->tipo == AUTO) {
+                subtramos[siguiente].contadorAutos++;
+            } else {
+                subtramos[siguiente].contadorCamiones++;
+            }
+            estadisticasSubtramos[siguiente][v->dir]++;
+            printf("📊 Subtramo %d - Autos: %d, Camiones: %d, Total: %d\n", 
+                   siguiente + 1, subtramos[siguiente].contadorAutos, 
+                   subtramos[siguiente].contadorCamiones, subtramos[siguiente].vehiculosPresentes);
+            pthread_mutex_unlock(&subtramos[siguiente].mutex);
+        }
+    }
+    
+    printf("🏁 Vehículo %d terminó su recorrido\n", v->id);
+    free(v);
+    return NULL;
+}
+
+// Función para mostrar estadísticas
+void mostrar_estadisticas()
+{
+    printf("\n");
+    printf("📊 ========== ESTADÍSTICAS FINALES ==========\n");
+    
+    // Estadísticas horarias
+    printf("\n📈 ESTADÍSTICAS HORARIAS (vehículos generados por hora):\n");
+    printf("Hora | Dirección 1→4 | Dirección 4→1 | Total\n");
+    printf("-----|---------------|---------------|-------\n");
+    for (int hora = 0; hora < 24; hora++) {
+        int total_hora = estadisticasHorarias[hora][0] + estadisticasHorarias[hora][1];
+        printf("%2d   | %13d | %13d | %5d\n", 
+               hora+1, estadisticasHorarias[hora][0], estadisticasHorarias[hora][1], total_hora);
+    }
+    
+    // Estadísticas por subtramo
+    printf("\n🛣️  ESTADÍSTICAS POR SUBTRAMO (vehículos que circularon):\n");
+    for (int i = 0; i < 4; i++) {
+        int total_subtramo = estadisticasSubtramos[i][0] + estadisticasSubtramos[i][1];
+        printf("Subtramo %d:\n", i + 1);
+        printf("  Dirección 1→4: %d vehículos\n", estadisticasSubtramos[i][0]);
+        printf("  Dirección 4→1: %d vehículos\n", estadisticasSubtramos[i][1]);
+        printf("  Total: %d vehículos\n", total_subtramo);
+    }
+    
+    // Estadísticas de hombrillos
+    printf("\n🅿️  ESTADÍSTICAS DE HOMBRILLOS:\n");
+    for (int i = 0; i < 3; i++) {
+        printf("Hombrillo %d-%d:\n", i + 1, i + 2);
+        printf("  Máximo vehículos esperando: %d\n", hombrillos[i].maxEspera);
+        printf("  Tiempo máximo de espera: %ld segundos\n", hombrillos[i].tiempoMaxEspera);
+        if (hombrillos[i].totalVehiculosEsperado > 0) {
+            double promedio = (double)hombrillos[i].tiempoTotalEspera / hombrillos[i].totalVehiculosEsperado;
+            printf("  Tiempo promedio de espera: %.2f segundos\n", promedio);
+        }
+        printf("  Total vehículos que esperaron: %d\n", hombrillos[i].totalVehiculosEsperado);
+    }
+    
+    printf("\n📦 TOTAL DE VEHÍCULOS EN EL DÍA: %d\n", totalVehiculosDia);
+    printf("==========================================\n");
+}
+
+// Función para limpiar recursos
+void limpiar_recursos()
+{
+    for (int i = 0; i < 4; i++) {
+        sem_destroy(&subtramos[i].semaforo);
+        pthread_mutex_destroy(&subtramos[i].mutex);
+    }
+    
+    for (int i = 0; i < 3; i++) {
+        sem_destroy(&hombrillos[i].semaforo);
+        pthread_mutex_destroy(&hombrillos[i].mutex);
+    }
+    
+    pthread_mutex_destroy(&statsMutex);
+}
+
+int main() {
+    srand(time(NULL)); // Semilla de tiempo aleatoria
+    inicioSimulacion = time(NULL);
+    inicializar_recursos();
+
+    printf("🚦 INICIANDO SIMULACIÓN DE TRÁFICO ACELERADA\n");
+    printf("⏰ Duración real: %d segundos (~%d minutos)\n", TOTAL_SEGUNDOS_SIMULACION, TOTAL_SEGUNDOS_SIMULACION/60);
+    printf("⏰ Duración simulada: %d horas\n", HORAS_SIMULACION);
+    printf("🚗 Vehículos por hora: %d\n", VEHICULOS_POR_HORA);
+    printf("📊 Total de vehículos: %d\n", TOTAL_VEHICULOS);
+    printf("⏱️  Escala: 1 hora real = %d segundos simulados\n", SEGUNDOS_POR_HORA_SIMULACION);
+    printf("==========================================\n");
+
+    int vehiculosGenerados = 0;
+
+    time_t inicio_generacion = time(NULL);
+    
+    while (vehiculosGenerados < TOTAL_VEHICULOS)
+    {
+        // Verificar si hemos superado el tiempo total de simulación
+        if (difftime(time(NULL), inicioSimulacion) >= TOTAL_SEGUNDOS_SIMULACION) {
+            printf("⏰ TIEMPO DE SIMULACIÓN COMPLETADO - Deteniendo generación de vehículos\n");
+            break;
+        }
+        
+        Vehiculo* v = malloc(sizeof(Vehiculo));
+        v->id = vehiculosGenerados + 1;
+        v->tipo = (rand() % 4 == 0) ? CAMION : AUTO; // 75% autos / 25% camiones
+        v->dir = (rand() % 2) ? DIR_1A4 : DIR_4A1;   // 50% de cada direcion
+        v->horaEntrada = time(NULL);
+        
+        pthread_t hilo;
+        pthread_create(&hilo, NULL, vehiculoThread, v); // Crea e inicia hilo del vehiculo
+        pthread_detach(hilo);  // Para terminar el hilo correctamente
+        
+        vehiculosGenerados++;
+        
+        /*// Mostrar progreso cada 100 vehículos
+        if (vehiculosGenerados % 500 == 0) {
+            int hora_actual = obtener_hora_actual();
+            printf("📦 Generados %d/%d vehículos - Hora simulada: %d:00\n", 
+                   vehiculosGenerados, TOTAL_VEHICULOS, hora_actual);
+        }*/
+        
+        // Esperar tiempo calculado para mantener tasa de 500/hora en tiempo simulado
+        usleep(55000 + (rand() % 10001)); // 0.055 - 0.065 segundos para generar vehiculo
+
+    }
+    
+    printf("✅ GENERACIÓN DE VEHÍCULOS COMPLETADA\n");
+    printf("⏳ Esperando que terminen los vehículos en circulación...\n");
+    
+    // Esperar a que terminen los vehículos (tiempo adicional para que terminen)
+    sleep(10);
+    
+    mostrar_estadisticas();
+    limpiar_recursos();
+    
+    printf("🎯 SIMULACIÓN COMPLETADA EXITOSAMENTE\n");
+    printf("⏱️  Tiempo real de ejecución: %.0f segundos\n", difftime(time(NULL), inicioSimulacion));
+    return 0;
+}
